@@ -1,0 +1,53 @@
+services:
+  migration-api:
+    build: .
+    image: lab-migration-api:local
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_PATH: /app/data/lab.db
+      SEED_DATABASE_PATH: /app/seed/lab_wide.db
+      MIGRATION_CHUNK_SIZE: "${MIGRATION_CHUNK_SIZE:-100}"
+      MIGRATION_CHUNK_DELAY_MS: "${MIGRATION_CHUNK_DELAY_MS:-100}"
+      SQLITE_BUSY_TIMEOUT_MS: "30000"
+      AUTO_RESUME: "true"
+    volumes:
+      - lab-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  legacy-acquisition:
+    build: .
+    image: lab-migration-api:local
+    # The legacy program has no server of its own.  This container keeps a
+    # shell available so it can be driven while migration runs:
+    #   docker compose exec legacy-acquisition \
+    #     python -m legacy.acquisition --db /app/data/lab.db select 1
+    command:
+      - python
+      - -c
+      - |
+        import time
+        print("legacy acquisition container ready", flush=True)
+        while True:
+            time.sleep(3600)
+    environment:
+      DATABASE_PATH: /app/data/lab.db
+    volumes:
+      - lab-data:/app/data
+    depends_on:
+      migration-api:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  lab-data:

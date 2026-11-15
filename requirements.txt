@@ -1,0 +1,3 @@
+fastapi==0.163.1
+uvicorn==0.54.0
+# Test-only dependency group: see requirements-dev.txt
