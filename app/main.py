@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Path, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .config import Settings
+from .imports import ImportBatchRequest, ImportBatchResponse, ImportService
 from .migration import MigrationEngine, MigrationError
 from .repository import (
     DEFAULT_PAGE,
@@ -25,10 +29,27 @@ logging.basicConfig(
 logger = logging.getLogger("api")
 
 
+def _json_safe(value: Any) -> Any:
+    """Make validation-error payloads JSON-serializable.
+
+    A request may contain ``NaN``/``Infinity`` (Python's JSON parser accepts
+    those literals).  Echoing them back in a 422 body would crash the default
+    error handler with a non-compliant-JSON ``ValueError``.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     engine = MigrationEngine(settings)
     repository = SampleRepository(settings)
+    importer = ImportService(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -36,15 +57,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = settings
         app.state.engine = engine
         app.state.repository = repository
+        app.state.importer = importer
         yield
         engine.wait_for_idle(timeout=5)
 
     app = FastAPI(
         title="Lab wide-to-long migration API",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "在线将 samples(id, temperature, ph) 宽表迁移为 sample_metrics 长表；"
             "迁移期间旧采集程序仍可读写，切换后 samples 由兼容视图提供。"
+            "另提供离线仪器补传的修订号批量导入接口。"
         ),
         lifespan=lifespan,
     )
@@ -54,6 +77,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def get_repo(request: Request) -> SampleRepository:
         return request.app.state.repository
+
+    def get_importer(request: Request) -> ImportService:
+        return request.app.state.importer
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # Same shape as FastAPI's default 422, but safe for non-finite floats.
+        errors = jsonable_encoder(exc.errors(), custom_encoder={float: repr})
+        return JSONResponse(status_code=422, content={"detail": _json_safe(errors)})
 
     @app.exception_handler(InvalidQuery)
     async def _invalid_query(_request: Request, exc: InvalidQuery) -> JSONResponse:
@@ -100,6 +134,72 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: Annotated[int, Query(ge=1, le=500)] = 50,
     ) -> dict[str, Any]:
         return {"events": get_engine(request).events(limit=limit)}
+
+    # --------------------------------------------------------------- imports
+    @app.post(
+        "/imports/offline",
+        response_model=ImportBatchResponse,
+        response_model_exclude_none=False,
+        summary="批量导入离线仪器补传记录（带修订号）",
+        responses={
+            200: {
+                "description": (
+                    "整批受理（status=accepted，逐行 created/replaced/unchanged）"
+                    "或整批拒绝（status=rejected，原数据不变）"
+                ),
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "status": "accepted",
+                            "row_count": 2,
+                            "created": 1,
+                            "replaced": 1,
+                            "unchanged": 0,
+                            "rejected": 0,
+                            "rows": [
+                                {
+                                    "index": 0,
+                                    "device_no": "DEV-001",
+                                    "source_no": "S-1001",
+                                    "revision": 1,
+                                    "temperature": 36.5,
+                                    "ph": 7.2,
+                                    "status": "created",
+                                    "sample_id": 43,
+                                    "previous_revision": None,
+                                    "code": None,
+                                    "message": None,
+                                },
+                                {
+                                    "index": 1,
+                                    "device_no": "DEV-001",
+                                    "source_no": "S-1002",
+                                    "revision": 3,
+                                    "temperature": 36.8,
+                                    "ph": 7.1,
+                                    "status": "replaced",
+                                    "sample_id": 44,
+                                    "previous_revision": 2,
+                                    "code": None,
+                                    "message": None,
+                                },
+                            ],
+                        }
+                    }
+                },
+            }
+        },
+    )
+    def import_offline(
+        request: Request, batch: ImportBatchRequest
+    ) -> ImportBatchResponse:
+        """离线仪器补传：按 (device_no, source_no, revision) 批量导入温度/pH。
+
+        同一设备与源记录沿用首次分配的 sample_id：更高修订整组替换，同版同值重传
+        幂等；旧版、同版异值、批内重复源记录号均整批拒绝且不修改任何数据。
+        并发请求按数据库提交顺序判定版本。迁移前后均可用。
+        """
+        return get_importer(request).import_batch(batch)
 
     # --------------------------------------------------------------- metrics
     @app.get("/metrics/{metric}")

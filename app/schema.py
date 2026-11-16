@@ -35,6 +35,25 @@ CREATE TABLE IF NOT EXISTS migration_state (
 )
 """
 
+# Offline instrument re-sends: one row per (device_no, source_no).  Holds the
+# revision accepted last and the sample_id assigned on first acceptance.  The
+# sample_id itself lives in ``samples`` so the same value is what the legacy
+# program and every read API sees.  Kept independent of the migration so the
+# import API works before and after cutover.
+IMPORT_RECORDS_SQL = """
+CREATE TABLE IF NOT EXISTS import_records (
+    device_no   TEXT    NOT NULL,
+    source_no   TEXT    NOT NULL,
+    sample_id   INTEGER NOT NULL UNIQUE,
+    revision    INTEGER NOT NULL CHECK (revision >= 1),
+    temperature REAL    NOT NULL,
+    ph          REAL    NOT NULL,
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL,
+    PRIMARY KEY (device_no, source_no)
+) WITHOUT ROWID
+"""
+
 MIGRATION_EVENT_SQL = """
 CREATE TABLE IF NOT EXISTS migration_events (
     seq    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,6 +216,12 @@ def create_base_schema(conn) -> None:
     conn.execute(MIGRATION_TABLE_SQL)
     conn.execute(MIGRATION_EVENT_SQL)
     conn.execute(INSERT_CONTEXT_SQL)
+    conn.execute(IMPORT_RECORDS_SQL)
+    # Supports MAX(sample_id) and the per-source ordering used above.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_import_records_sample"
+        " ON import_records(sample_id)"
+    )
 
 
 def ensure_wide_table(conn) -> None:
